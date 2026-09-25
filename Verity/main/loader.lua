@@ -61,7 +61,7 @@ local RETURN_CFRAME = CFrame.new(
 )
 
 -- Tiempo de espera entre intentos si no hay caja disponible (segundos)
-local RETRY_WAIT    = 1
+local RETRY_WAIT    = 2
 -- Tiempo de espera después de teleportarse DENTRO de la caja (antes de recoger)
 local INSIDE_WAIT   = 5
 -- Tiempo de espera después de volver al punto de retorno (antes del siguiente ciclo)
