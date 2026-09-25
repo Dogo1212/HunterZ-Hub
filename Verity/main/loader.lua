@@ -61,13 +61,13 @@ local RETURN_CFRAME = CFrame.new(
 )
 
 -- Tiempo de espera entre intentos si no hay caja disponible (segundos)
-local RETRY_WAIT    = 2
+local RETRY_WAIT    = 1
 -- Tiempo de espera después de teleportarse DENTRO de la caja (antes de recoger)
-local INSIDE_WAIT   = 2
+local INSIDE_WAIT   = 5
 -- Tiempo de espera después de volver al punto de retorno (antes del siguiente ciclo)
-local RETURN_WAIT   = 2
+local RETURN_WAIT   = 3.5
 -- HoldDuration forzado en el PickupPrompt
-local PICKUP_HOLD   = 0.5
+local PICKUP_HOLD   = 1
 
 -- ==================== UTILIDADES ====================
 
