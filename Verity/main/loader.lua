@@ -1,15 +1,16 @@
 --[[
 ╔══════════════════════════════════════════════════════════════╗
-║         HunterZ Hub — Verity Module v1.0                     ║
+║         HunterZ Hub — Verity Module v2.0                     ║
 ║         PlaceId: 104526416639079                             ║
 ║                                                              ║
 ║  Features:                                                   ║
 ║  • [Farm] Auto Farm Boxes — Toggle ON/OFF                    ║
 ║    - Busca la caja disponible con mayor weight               ║
 ║    - Teleporta al jugador dentro de la caja                  ║
-║    - Fija HoldDuration del PickupPrompt a 0.1                ║
+║    - Fija HoldDuration del PickupPrompt a 0.5                ║
 ║    - Al terminar, va a las coordenadas de retorno            ║
 ║    - Repite el ciclo mientras esté ON                        ║
+║    - Tp cada 2 segundos                                      ║
 ╚══════════════════════════════════════════════════════════════╝
 --]]
 
@@ -66,7 +67,7 @@ local INSIDE_WAIT   = 2
 -- Tiempo de espera después de volver al punto de retorno (antes del siguiente ciclo)
 local RETURN_WAIT   = 2
 -- HoldDuration forzado en el PickupPrompt
-local PICKUP_HOLD   = 0.1
+local PICKUP_HOLD   = 0.5
 
 -- ==================== UTILIDADES ====================
 
