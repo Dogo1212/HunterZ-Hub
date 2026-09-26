@@ -1,16 +1,24 @@
 --[[
 ╔══════════════════════════════════════════════════════════════╗
-║         HunterZ Hub — Verity Module v3.0                     ║
+║         HunterZ Hub — Verity Module v4.0                     ║
 ║         PlaceId: 104526416639079                             ║
 ║                                                              ║
-║  Fixes v3.0:                                                 ║
-║  • ESP: filtrar cajas fuera de pantalla correctamente        ║
-║  • ESP: buscar PrimaryPart o primera BasePart del modelo     ║
-║  • ESP: etiquetas con outline negro siempre visibles         ║
-║  • ESP: distancia máxima configurable para no spamear        ║
-║  • Farm: busca ProximityPrompt en el modelo directamente     ║
-║    (no dentro de subcarpeta Main)                            ║
-║  • Farm: prioridad por weight correcta                       ║
+║  Fixes v4.0:                                                 ║
+║  • ESP: Drawing.Fonts.GothamBold NO EXISTE en la API Drawing ║
+║    (solo UI/System/Plex/Monospace) — causaba que el hilo     ║
+║    del ESP truene a mitad de camino y dejara recuadros       ║
+║    pegados en pantalla para siempre. Corregido.              ║
+║  • ESP: cada Drawing se registra en la tabla de limpieza      ║
+║    INMEDIATAMENTE al crearse, y todo el bloque por caja va    ║
+║    envuelto en pcall — un error nunca deja basura huérfana   ║
+║  • ESP: búsqueda por GetDescendants (soporta que las cajas    ║
+║    estén dentro de subcarpetas, no solo hijos directos)       ║
+║  • Farm: búsqueda también por GetDescendants                 ║
+║  • Farm: ignora ProximityPrompt.Enabled == false (caja aún    ║
+║    en animación de entrada) y cae correctamente a la          ║
+║    siguiente mejor disponible — así SIEMPRE prioriza la de    ║
+║    mayor weight que esté realmente lista para recoger         ║
+║  • Farm: log claro de qué caja eligió y por qué               ║
 ╚══════════════════════════════════════════════════════════════╝
 --]]
 
@@ -28,7 +36,7 @@ local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
 
 -- ==================== DATOS DE CAJAS ====================
--- Ordenadas por weight DESC — mayor weight = más valiosa
+-- Ordenadas por weight DESC — mayor weight = más valiosa = mayor prioridad
 local BOX_DATA = {
     { name = "1x1x1x1",   weight = 65000000, rarityType = "Secret"    },
     { name = "Rainbow",    weight = 20000000, rarityType = "Mythic"    },
@@ -50,13 +58,11 @@ local BOX_DATA = {
     { name = "Cardboard",  weight = 10,       rarityType = "Common"    },
 }
 
--- Lookup rápido nombre → datos
 local BOX_LOOKUP = {}
 for _, entry in ipairs(BOX_DATA) do
     BOX_LOOKUP[entry.name] = entry
 end
 
--- Color por rareza
 local RARITY_COLOR = {
     Common    = Color3.fromRGB(180, 180, 180),
     Uncommon  = Color3.fromRGB(80,  200, 80 ),
@@ -67,7 +73,10 @@ local RARITY_COLOR = {
     Secret    = Color3.fromRGB(255, 220, 50 ),
 }
 
--- CFrame de retorno
+-- Fuentes VÁLIDAS de la API Drawing (GothamBold/Gotham NO EXISTEN y rompían el ESP)
+local FONT_MAIN = Drawing.Fonts.System
+local FONT_SUB  = Drawing.Fonts.UI
+
 local RETURN_CFRAME = CFrame.new(
     -120, 10.4569969, -176,
     -1, 0, 0,
@@ -75,14 +84,14 @@ local RETURN_CFRAME = CFrame.new(
      0, 0, -1
 )
 
--- Tiempos (valores que funcionaron)
-local RETRY_WAIT  = 3
+-- Tiempos
+local RETRY_WAIT  = 2
 local INSIDE_WAIT = 5
-local RETURN_WAIT = 4
+local RETURN_WAIT = 3.5
 local PICKUP_HOLD = 1
 
--- Distancia máxima para mostrar en ESP (studs). Evita ruido visual de cajas lejanas.
-local ESP_MAX_DIST = 500
+-- Distancia máxima para el ESP (studs)
+local ESP_MAX_DIST = 2500
 
 -- ==================== UTILIDADES ====================
 
@@ -100,7 +109,6 @@ local function teleportTo(cf)
     if hrp then hrp.CFrame = cf end
 end
 
--- Obtiene la BasePart raíz de un modelo (igual que getRoot del juego)
 local function getRoot(model)
     if model:IsA("Model") then
         return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
@@ -108,7 +116,6 @@ local function getRoot(model)
     return model
 end
 
--- Formatea número con comas (65000000 → "65,000,000")
 local function formatWeight(w)
     local s = tostring(math.floor(w))
     local result = ""
@@ -122,63 +129,72 @@ local function formatWeight(w)
     return result
 end
 
--- World → Screen, devuelve pos2D, onScreen, depth
 local function worldToScreen(pos)
     local sp, onScreen = Camera:WorldToViewportPoint(pos)
     return Vector2.new(sp.X, sp.Y), onScreen, sp.Z
 end
 
+--[[
+    Recorre TODOS los descendientes de workspace.Boxes (soporta
+    tanto estructura plana como carpetas anidadas por tipo/jugador)
+    y devuelve una lista de { model, weight, rarityType, prompt, part }
+    de cada caja de tipo conocido que exista ahora mismo en el mapa.
+--]]
+local function scanAllBoxes()
+    local boxesFolder = workspace:FindFirstChild("Boxes")
+    if not boxesFolder then return {} end
+
+    local found = {}
+    for _, obj in ipairs(boxesFolder:GetDescendants()) do
+        if obj:IsA("Model") then
+            local info = BOX_LOOKUP[obj.Name]
+            if info then
+                table.insert(found, { model = obj, info = info })
+            end
+        end
+    end
+    return found
+end
+
 -- ==================== FARM ====================
 
 --[[
-    Busca la caja de mayor weight disponible en workspace.Boxes.
-    Busca el ProximityPrompt directamente en los descendientes del modelo
-    (el juego no usa subcarpeta Main para los prompts).
-    Devuelve: boxModel, rootPart, pickupPart, pickupPrompt
+    Elige la mejor caja EN CONDICIONES DE SER RECOGIDA AHORA MISMO:
+    - Debe existir en el mapa
+    - No debe estar en animación de entrada (atributo Flying)
+    - Debe tener un ProximityPrompt habilitado (Enabled == true)
+    Entre todas las que cumplen, se queda con la de mayor weight.
 --]]
 local function findBestBox()
-    local boxesFolder = workspace:FindFirstChild("Boxes")
-    if not boxesFolder then
-        warn("[HunterZ/Verity] No se encontró workspace.Boxes")
-        return nil, nil, nil, nil
-    end
+    local candidates = scanAllBoxes()
+    if #candidates == 0 then return nil, nil, nil end
 
-    for _, entry in ipairs(BOX_DATA) do
-        -- Buscar todas las instancias de esta caja (puede haber varias en el mapa)
-        -- Nos quedamos con la primera que tenga ProximityPrompt
-        for _, child in ipairs(boxesFolder:GetChildren()) do
-            if child.Name == entry.name and child:IsA("Model") then
-                -- Verificar que no esté siendo cargada (atributo Flying)
-                if child:GetAttribute("Flying") then continue end
+    -- Ordenar candidatas por weight descendente
+    table.sort(candidates, function(a, b) return a.info.weight > b.info.weight end)
 
-                local rootPart = getRoot(child)
-                if not rootPart then continue end
-
-                -- Buscar ProximityPrompt en cualquier descendiente
-                for _, desc in ipairs(child:GetDescendants()) do
-                    if desc:IsA("ProximityPrompt") then
-                        local part = desc.Parent
-                        if part and part:IsA("BasePart") then
-                            return child, rootPart, part, desc
-                        end
+    for _, c in ipairs(candidates) do
+        local model = c.model
+        if model.Parent and not model:GetAttribute("Flying") then
+            for _, desc in ipairs(model:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") and desc.Enabled then
+                    local part = desc.Parent
+                    if part and part:IsA("BasePart") then
+                        return model, part, desc
                     end
                 end
             end
         end
     end
 
-    return nil, nil, nil, nil
+    return nil, nil, nil
 end
 
 local function collectBox(pickupPart, pickupPrompt)
-    -- Forzar hold duration mínimo
     pcall(function() pickupPrompt.HoldDuration = PICKUP_HOLD end)
 
-    -- Teleportar encima del part con el prompt
     teleportTo(pickupPart.CFrame + Vector3.new(0, 3, 0))
     task.wait(INSIDE_WAIT)
 
-    -- Intentar disparar el prompt
     local fired = false
     if fireproximityprompt then
         pcall(function()
@@ -214,18 +230,19 @@ local function startFarmLoop()
                 continue
             end
 
-            local boxModel, rootPart, pickupPart, pickupPrompt = findBestBox()
+            local boxModel, pickupPart, pickupPrompt = findBestBox()
 
             if not boxModel then
-                warn("[HunterZ/Verity] No hay cajas disponibles, reintentando...")
+                warn("[HunterZ/Verity] No hay cajas listas para recoger, reintentando...")
                 task.wait(RETRY_WAIT)
                 continue
             end
 
             local info = BOX_LOOKUP[boxModel.Name]
-            print(string.format("[HunterZ/Verity] Farmeando: %s (weight: %s)",
+            print(string.format("[HunterZ/Verity] >> Prioridad: %s | Weight: %s | Rareza: %s",
                 boxModel.Name,
-                info and formatWeight(info.weight) or "?"))
+                info and formatWeight(info.weight) or "?",
+                info and info.rarityType or "?"))
 
             collectBox(pickupPart, pickupPrompt)
 
@@ -259,19 +276,12 @@ local function clearESP()
     HZ.ESP.Drawings = {}
 end
 
--- Crea un Drawing.Text con outline negro automático
-local function makeText(text, size, color, pos)
-    local t = Drawing.new("Text")
-    t.Visible      = true
-    t.Text         = text
-    t.Size         = size
-    t.Font         = Drawing.Fonts.GothamBold
-    t.Color        = color
-    t.Outline      = true
-    t.OutlineColor = Color3.fromRGB(0, 0, 0)
-    t.Transparency = 1
-    t.Position     = pos
-    return t
+-- Crea un Drawing y lo agrega INMEDIATAMENTE a bucket para que
+-- clearESP() siempre pueda encontrarlo, incluso si algo falla después.
+local function trackedDrawing(class, bucket)
+    local d = Drawing.new(class)
+    table.insert(bucket, d)
+    return d
 end
 
 local function startESPLoop()
@@ -286,114 +296,122 @@ local function startESPLoop()
         while HZ.ESP.Active do
             clearESP()
 
-            local boxesFolder = workspace:FindFirstChild("Boxes")
-            if not boxesFolder then
-                task.wait(0.5)
-                continue
-            end
-
+            local boxes = scanAllBoxes()
             local _, hrp = getCharacter()
             local vpSize       = Camera.ViewportSize
-            local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y)  -- líneas desde abajo centro
+            local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y)
 
-            -- Iterar los hijos reales de workspace.Boxes
-            for _, child in ipairs(boxesFolder:GetChildren()) do
-                if not child:IsA("Model") then continue end
+            for _, c in ipairs(boxes) do
+                local model = c.model
+                local info  = c.info
 
-                local info = BOX_LOOKUP[child.Name]
-                if not info then continue end  -- ignorar cajas legacy o desconocidas
+                -- Todo el trabajo de UNA caja va protegido: si algo falla,
+                -- no rompe el resto del ESP ni deja basura sin registrar.
+                pcall(function()
+                    if not model.Parent then return end
 
-                local rootPart = getRoot(child)
-                if not rootPart then continue end
+                    local rootPart = getRoot(model)
+                    if not rootPart then return end
 
-                -- Filtrar por distancia
-                if hrp then
-                    local dist = (rootPart.Position - hrp.Position).Magnitude
-                    if dist > ESP_MAX_DIST then continue end
-                end
+                    if hrp then
+                        local dist = (rootPart.Position - hrp.Position).Magnitude
+                        if dist > ESP_MAX_DIST then return end
+                    end
 
-                local worldPos            = rootPart.Position
-                local screenPos, onScreen, depth = worldToScreen(worldPos)
+                    local worldPos = rootPart.Position
+                    local screenPos, onScreen, depth = worldToScreen(worldPos)
+                    if not onScreen or depth <= 1 then return end
 
-                -- Solo dibujar si está en pantalla y delante de la cámara
-                if not onScreen or depth <= 0 then continue end
+                    local rarity   = info.rarityType
+                    local weight   = info.weight
+                    local boxColor = RARITY_COLOR[rarity] or Color3.fromRGB(0, 255, 128)
 
-                local rarity   = info.rarityType
-                local weight   = info.weight
-                local boxColor = RARITY_COLOR[rarity] or Color3.fromRGB(0, 255, 128)
+                    local boxH  = math.clamp(1600 / depth, 18, 100)
+                    local boxW  = boxH * 0.8
+                    local halfW = boxW * 0.5
+                    local halfH = boxH * 0.5
+                    local topY  = screenPos.Y - halfH
+                    local leftX = screenPos.X - halfW
 
-                -- Tamaño del recuadro adaptado a la distancia
-                local boxH  = math.clamp(1600 / depth, 18, 100)
-                local boxW  = boxH * 0.8
-                local halfW = boxW * 0.5
-                local halfH = boxH * 0.5
-                local topY  = screenPos.Y - halfH
-                local leftX = screenPos.X - halfW
+                    -- Bucket propio de esta caja: se registra en HZ.ESP.Drawings
+                    -- ANTES de dibujar nada más, así siempre es limpiable.
+                    local bucket = {}
+                    HZ.ESP.Drawings[tostring(model)] = bucket
 
-                local drawings = {}
+                    -- Outline negro
+                    local outline = trackedDrawing("Square", bucket)
+                    outline.Visible      = true
+                    outline.Filled       = false
+                    outline.Thickness    = 3
+                    outline.Color        = Color3.fromRGB(0, 0, 0)
+                    outline.Transparency = 1
+                    outline.Size         = Vector2.new(boxW + 4, boxH + 4)
+                    outline.Position     = Vector2.new(leftX - 2, topY - 2)
 
-                -- ── Outline negro ─────────────────────────────────────
-                local outline = Drawing.new("Square")
-                outline.Visible      = true
-                outline.Filled       = false
-                outline.Thickness    = 3
-                outline.Color        = Color3.fromRGB(0, 0, 0)
-                outline.Transparency = 1
-                outline.Size         = Vector2.new(boxW + 4, boxH + 4)
-                outline.Position     = Vector2.new(leftX - 2, topY - 2)
-                table.insert(drawings, outline)
+                    -- Box coloreado
+                    local box = trackedDrawing("Square", bucket)
+                    box.Visible      = true
+                    box.Filled       = false
+                    box.Thickness    = 1.5
+                    box.Color        = boxColor
+                    box.Transparency = 1
+                    box.Size         = Vector2.new(boxW, boxH)
+                    box.Position     = Vector2.new(leftX, topY)
 
-                -- ── Box coloreado ─────────────────────────────────────
-                local box = Drawing.new("Square")
-                box.Visible      = true
-                box.Filled       = false
-                box.Thickness    = 1.5
-                box.Color        = boxColor
-                box.Transparency = 1
-                box.Size         = Vector2.new(boxW, boxH)
-                box.Position     = Vector2.new(leftX, topY)
-                table.insert(drawings, box)
+                    -- Línea desde abajo-centro de pantalla
+                    local line = trackedDrawing("Line", bucket)
+                    line.Visible      = true
+                    line.Thickness    = 1
+                    line.Color        = boxColor
+                    line.Transparency = 0.5
+                    line.From         = screenCenter
+                    line.To           = screenPos
 
-                -- ── Línea desde borde inferior centro al box ──────────
-                local line = Drawing.new("Line")
-                line.Visible      = true
-                line.Thickness    = 1
-                line.Color        = boxColor
-                line.Transparency = 0.5
-                line.From         = screenCenter
-                line.To           = screenPos
-                table.insert(drawings, line)
+                    -- Etiquetas
+                    local labelSize = math.clamp(math.floor(1200 / depth), 9, 15)
+                    local lineH     = labelSize + 3
+                    local labelX    = leftX
+                    local labelY    = topY + boxH + 4
 
-                -- ── Etiquetas debajo del box ──────────────────────────
-                local labelSize = math.clamp(math.floor(1200 / depth), 9, 15)
-                local lineH     = labelSize + 2
-                local labelX    = leftX
-                local labelY    = topY + boxH + 4
+                    local lblName = trackedDrawing("Text", bucket)
+                    lblName.Visible      = true
+                    lblName.Text         = "[" .. model.Name .. "]"
+                    lblName.Size         = labelSize
+                    lblName.Font         = FONT_MAIN
+                    lblName.Color        = boxColor
+                    lblName.Outline      = true
+                    lblName.OutlineColor = Color3.fromRGB(0, 0, 0)
+                    lblName.Transparency = 1
+                    lblName.Center       = false
+                    lblName.Position     = Vector2.new(labelX, labelY)
 
-                table.insert(drawings, makeText(
-                    "[" .. child.Name .. "]",
-                    labelSize,
-                    boxColor,
-                    Vector2.new(labelX, labelY)
-                ))
-                table.insert(drawings, makeText(
-                    "[" .. rarity .. "]",
-                    labelSize - 1,
-                    Color3.fromRGB(210, 210, 210),
-                    Vector2.new(labelX, labelY + lineH)
-                ))
-                table.insert(drawings, makeText(
-                    "[Weight: " .. formatWeight(weight) .. "]",
-                    labelSize - 1,
-                    Color3.fromRGB(255, 210, 60),
-                    Vector2.new(labelX, labelY + lineH * 2)
-                ))
+                    local lblRarity = trackedDrawing("Text", bucket)
+                    lblRarity.Visible      = true
+                    lblRarity.Text         = "[" .. rarity .. "]"
+                    lblRarity.Size         = labelSize - 1
+                    lblRarity.Font         = FONT_SUB
+                    lblRarity.Color        = Color3.fromRGB(210, 210, 210)
+                    lblRarity.Outline      = true
+                    lblRarity.OutlineColor = Color3.fromRGB(0, 0, 0)
+                    lblRarity.Transparency = 1
+                    lblRarity.Center       = false
+                    lblRarity.Position     = Vector2.new(labelX, labelY + lineH)
 
-                -- Guardar con clave única (nombre + id de la instancia)
-                HZ.ESP.Drawings[tostring(child)] = drawings
+                    local lblWeight = trackedDrawing("Text", bucket)
+                    lblWeight.Visible      = true
+                    lblWeight.Text         = "[Weight: " .. formatWeight(weight) .. "]"
+                    lblWeight.Size         = labelSize - 1
+                    lblWeight.Font         = FONT_SUB
+                    lblWeight.Color        = Color3.fromRGB(255, 210, 60)
+                    lblWeight.Outline      = true
+                    lblWeight.OutlineColor = Color3.fromRGB(0, 0, 0)
+                    lblWeight.Transparency = 1
+                    lblWeight.Center       = false
+                    lblWeight.Position     = Vector2.new(labelX, labelY + lineH * 2)
+                end)
             end
 
-            task.wait(1 / 30)  -- ~30 FPS
+            task.wait(1 / 30)
         end
 
         clearESP()
