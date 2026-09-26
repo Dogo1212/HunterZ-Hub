@@ -1,30 +1,37 @@
 --[[
 ╔══════════════════════════════════════════════════════════════╗
-║         HunterZ Hub — Verity Module v4.1                   ║
+║         HunterZ Hub — Verity Module v4.2                   ║
 ║         PlaceId: 104526416639079                            ║
 ║                                                              ║
-║  Cambios v4.1:                                               ║
-║  • ESP: reutiliza los Drawing existentes en vez de           ║
-║    destruirlos y crearlos en cada actualización.             ║
-║  • ESP: los recuadros siguen actualizándose al moverte.      ║
+║  Cambios v4.2:                                               ║
+║  • ESP: ya NO usa líneas/tracers desde la pantalla.          ║
+║  • ESP: conserva solamente recuadro + nombre + rareza       ║
+║    + weight.                                                  ║
+║  • ESP: reutiliza los Drawing existentes.                   ║
 ║  • ESP: solo elimina Drawing cuando una caja desaparece.     ║
+║  • ESP: limpia restos de una ejecución anterior al iniciar.  ║
 ║  • Farm: espera 1.5 segundos después de recoger una caja     ║
 ║    antes de regresar a RETURN_CFRAME.                       ║
-║  • Se mantiene la búsqueda mediante GetDescendants.         ║
+║  • Se mantiene GetDescendants para cajas anidadas.           ║
 ║  • Se mantiene la prioridad por Weight.                      ║
 ╚══════════════════════════════════════════════════════════════╝
 --]]
 
--- ==================== NAMESPACE ====================
+
+-- ============================================================
+--                        NAMESPACE
+-- ============================================================
 
 getgenv().HunterZ_Verity = getgenv().HunterZ_Verity or {}
 
 local HZ = getgenv().HunterZ_Verity
 
+
 HZ.Farm = HZ.Farm or {
     Active = false,
     Thread = nil
 }
+
 
 HZ.ESP = HZ.ESP or {
     Active = false,
@@ -33,7 +40,9 @@ HZ.ESP = HZ.ESP or {
 }
 
 
--- ==================== SERVICIOS ====================
+-- ============================================================
+--                         SERVICIOS
+-- ============================================================
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -42,10 +51,9 @@ local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
 
--- ==================== DATOS DE CAJAS ====================
-
--- Ordenadas por weight DESC
--- mayor weight = mayor prioridad
+-- ============================================================
+--                       DATOS DE CAJAS
+-- ============================================================
 
 local BOX_DATA = {
     { name = "1x1x1x1",   weight = 65000000, rarityType = "Secret"    },
@@ -76,7 +84,9 @@ for _, entry in ipairs(BOX_DATA) do
 end
 
 
--- ==================== COLORES ====================
+-- ============================================================
+--                     COLORES DE RAREZA
+-- ============================================================
 
 local RARITY_COLOR = {
     Common    = Color3.fromRGB(180, 180, 180),
@@ -89,13 +99,17 @@ local RARITY_COLOR = {
 }
 
 
--- ==================== FUENTES DRAWING ====================
+-- ============================================================
+--                         FUENTES
+-- ============================================================
 
 local FONT_MAIN = Drawing.Fonts.System
 local FONT_SUB = Drawing.Fonts.UI
 
 
--- ==================== POSICIÓN DE RETORNO ====================
+-- ============================================================
+--                      PUNTO DE RETORNO
+-- ============================================================
 
 local RETURN_CFRAME = CFrame.new(
     -120,
@@ -107,137 +121,232 @@ local RETURN_CFRAME = CFrame.new(
 )
 
 
--- ==================== TIEMPOS ====================
+-- ============================================================
+--                          TIEMPOS
+-- ============================================================
 
 local RETRY_WAIT = 2
 local INSIDE_WAIT = 5
 local RETURN_WAIT = 3.5
 local PICKUP_HOLD = 1
 
--- Espera adicional después de recoger
+-- Espera después de recoger antes de regresar
 local AFTER_PICKUP_WAIT = 1.5
 
 
--- ==================== ESP ====================
+-- ============================================================
+--                           ESP
+-- ============================================================
 
 local ESP_MAX_DIST = 2500
 
--- Actualizaciones por segundo
+-- 30 actualizaciones por segundo
 local ESP_UPDATE_RATE = 1 / 30
 
 
--- ==================== UTILIDADES ====================
+-- ============================================================
+--                         UTILIDADES
+-- ============================================================
 
 local function getCharacter()
+
     local char = LocalPlayer.Character
 
     if not char then
         return nil, nil
     end
 
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local hum = char:FindFirstChildOfClass("Humanoid")
 
-    if not hrp or not hum or hum.Health <= 0 then
+    local hrp =
+        char:FindFirstChild("HumanoidRootPart")
+
+
+    local hum =
+        char:FindFirstChildOfClass("Humanoid")
+
+
+    if not hrp
+        or not hum
+        or hum.Health <= 0 then
+
         return nil, nil
+
     end
 
+
     return char, hrp
+
 end
 
 
 local function teleportTo(cf)
+
     local _, hrp = getCharacter()
 
     if hrp then
         hrp.CFrame = cf
     end
+
 end
 
 
 local function getRoot(model)
+
     if model:IsA("Model") then
+
         return model.PrimaryPart
-            or model:FindFirstChildWhichIsA("BasePart", true)
+            or model:FindFirstChildWhichIsA(
+                "BasePart",
+                true
+            )
+
     end
 
+
     return model
+
 end
 
 
 local function formatWeight(w)
-    local s = tostring(math.floor(w))
+
+    local s =
+        tostring(
+            math.floor(w)
+        )
+
+
     local result = ""
+
     local len = #s
 
+
     for i = 1, len do
-        if i > 1 and (len - i + 1) % 3 == 0 then
-            result = result .. ","
+
+        if i > 1
+            and (len - i + 1) % 3 == 0 then
+
+            result =
+                result .. ","
+
         end
 
-        result = result .. s:sub(i, i)
+
+        result =
+            result .. s:sub(i, i)
+
     end
 
+
     return result
+
 end
 
 
--- ==================== BUSCAR CAJAS ====================
+-- ============================================================
+--                      BUSCAR TODAS LAS CAJAS
+-- ============================================================
 
 local function scanAllBoxes()
-    local boxesFolder = workspace:FindFirstChild("Boxes")
+
+    local boxesFolder =
+        workspace:FindFirstChild("Boxes")
+
 
     if not boxesFolder then
         return {}
     end
 
+
     local found = {}
 
-    for _, obj in ipairs(boxesFolder:GetDescendants()) do
+
+    for _, obj in ipairs(
+        boxesFolder:GetDescendants()
+    ) do
+
         if obj:IsA("Model") then
-            local info = BOX_LOOKUP[obj.Name]
+
+            local info =
+                BOX_LOOKUP[obj.Name]
+
 
             if info then
-                table.insert(found, {
-                    model = obj,
-                    info = info
-                })
+
+                table.insert(
+                    found,
+                    {
+                        model = obj,
+                        info = info
+                    }
+                )
+
             end
+
         end
+
     end
 
+
     return found
+
 end
 
 
--- ==================== FARM ====================
+-- ============================================================
+--                          FARM
+-- ============================================================
 
 local function findBestBox()
-    local candidates = scanAllBoxes()
+
+    local candidates =
+        scanAllBoxes()
+
 
     if #candidates == 0 then
         return nil, nil, nil
     end
 
-    -- Mayor Weight primero
-    table.sort(candidates, function(a, b)
-        return a.info.weight > b.info.weight
-    end)
+
+    -- Ordenar por Weight DESC
+    table.sort(
+        candidates,
+        function(a, b)
+            return a.info.weight > b.info.weight
+        end
+    )
 
 
     for _, c in ipairs(candidates) do
-        local model = c.model
 
-        if model.Parent and not model:GetAttribute("Flying") then
+        local model =
+            c.model
 
-            for _, desc in ipairs(model:GetDescendants()) do
 
-                if desc:IsA("ProximityPrompt") and desc.Enabled then
+        if model.Parent
+            and not model:GetAttribute("Flying") then
 
-                    local part = desc.Parent
 
-                    if part and part:IsA("BasePart") then
-                        return model, part, desc
+            for _, desc in ipairs(
+                model:GetDescendants()
+            ) do
+
+
+                if desc:IsA("ProximityPrompt")
+                    and desc.Enabled then
+
+
+                    local part =
+                        desc.Parent
+
+
+                    if part
+                        and part:IsA("BasePart") then
+
+                        return model,
+                            part,
+                            desc
+
                     end
 
                 end
@@ -245,58 +354,92 @@ local function findBestBox()
             end
 
         end
+
     end
 
+
     return nil, nil, nil
+
 end
 
 
--- ==================== RECOGER CAJA ====================
+-- ============================================================
+--                       RECOGER CAJA
+-- ============================================================
 
-local function collectBox(pickupPart, pickupPrompt)
+local function collectBox(
+    pickupPart,
+    pickupPrompt
+)
 
     pcall(function()
-        pickupPrompt.HoldDuration = PICKUP_HOLD
+
+        pickupPrompt.HoldDuration =
+            PICKUP_HOLD
+
     end)
 
 
-    -- Teletransportarse a la caja
+    -- Ir a la caja
+
     teleportTo(
-        pickupPart.CFrame + Vector3.new(0, 3, 0)
+        pickupPart.CFrame
+            + Vector3.new(
+                0,
+                3,
+                0
+            )
     )
 
 
-    -- Esperar dentro
-    task.wait(INSIDE_WAIT)
+    -- Esperar a estar dentro
+
+    task.wait(
+        INSIDE_WAIT
+    )
 
 
     local fired = false
 
 
     -- ProximityPrompt
+
     if fireproximityprompt then
 
         pcall(function()
-            fireproximityprompt(pickupPrompt)
+
+            fireproximityprompt(
+                pickupPrompt
+            )
+
             fired = true
+
         end)
 
     end
 
 
-    -- Fallback touch
-    if not fired and firetouchinterest then
+    -- Fallback Touch
 
-        local _, hrp = getCharacter()
+    if not fired
+        and firetouchinterest then
+
+
+        local _, hrp =
+            getCharacter()
+
 
         if hrp then
 
+
             pcall(function()
+
                 firetouchinterest(
                     hrp,
                     pickupPart,
                     0
                 )
+
             end)
 
 
@@ -304,11 +447,13 @@ local function collectBox(pickupPart, pickupPrompt)
 
 
             pcall(function()
+
                 firetouchinterest(
                     hrp,
                     pickupPart,
                     1
                 )
+
             end)
 
         end
@@ -321,112 +466,148 @@ local function collectBox(pickupPart, pickupPrompt)
 end
 
 
--- ==================== FARM LOOP ====================
+-- ============================================================
+--                       FARM LOOP
+-- ============================================================
 
 local function startFarmLoop()
 
     if HZ.Farm.Thread then
 
-        task.cancel(HZ.Farm.Thread)
+        task.cancel(
+            HZ.Farm.Thread
+        )
 
         HZ.Farm.Thread = nil
 
     end
 
 
-    HZ.Farm.Thread = task.spawn(function()
+    HZ.Farm.Thread =
+        task.spawn(function()
 
-        print("[HunterZ/Verity] Auto Farm iniciado")
-
-
-        while HZ.Farm.Active do
-
-            local _, hrp = getCharacter()
+            print(
+                "[HunterZ/Verity] Auto Farm iniciado"
+            )
 
 
-            if not hrp then
-
-                task.wait(RETRY_WAIT)
-
-                continue
-
-            end
+            while HZ.Farm.Active do
 
 
-            local boxModel, pickupPart, pickupPrompt =
-                findBestBox()
+                local _, hrp =
+                    getCharacter()
 
 
-            if not boxModel then
+                if not hrp then
 
-                warn(
-                    "[HunterZ/Verity] No hay cajas listas para recoger, reintentando..."
+                    task.wait(
+                        RETRY_WAIT
+                    )
+
+                    continue
+
+                end
+
+
+                local boxModel,
+                      pickupPart,
+                      pickupPrompt =
+                    findBestBox()
+
+
+                if not boxModel then
+
+                    warn(
+                        "[HunterZ/Verity] No hay cajas listas para recoger, reintentando..."
+                    )
+
+
+                    task.wait(
+                        RETRY_WAIT
+                    )
+
+
+                    continue
+
+                end
+
+
+                local info =
+                    BOX_LOOKUP[
+                        boxModel.Name
+                    ]
+
+
+                print(
+                    string.format(
+                        "[HunterZ/Verity] >> Prioridad: %s | Weight: %s | Rareza: %s",
+                        boxModel.Name,
+                        info
+                            and formatWeight(
+                                info.weight
+                            )
+                            or "?",
+                        info
+                            and info.rarityType
+                            or "?"
+                    )
                 )
 
-                task.wait(RETRY_WAIT)
 
-                continue
+                -- Recoger
+
+                collectBox(
+                    pickupPart,
+                    pickupPrompt
+                )
+
+
+                if not HZ.Farm.Active then
+                    break
+                end
+
+
+                -- =================================================
+                -- Espera adicional de 1.5 segundos
+                -- =================================================
+
+                task.wait(
+                    AFTER_PICKUP_WAIT
+                )
+
+
+                if not HZ.Farm.Active then
+                    break
+                end
+
+
+                -- Volver
+
+                teleportTo(
+                    RETURN_CFRAME
+                )
+
+
+                task.wait(
+                    RETURN_WAIT
+                )
+
 
             end
-
-
-            local info = BOX_LOOKUP[boxModel.Name]
 
 
             print(
-                string.format(
-                    "[HunterZ/Verity] >> Prioridad: %s | Weight: %s | Rareza: %s",
-                    boxModel.Name,
-                    info and formatWeight(info.weight) or "?",
-                    info and info.rarityType or "?"
-                )
+                "[HunterZ/Verity] Auto Farm detenido"
             )
 
-
-            -- Recoger
-            collectBox(
-                pickupPart,
-                pickupPrompt
-            )
-
-
-            if not HZ.Farm.Active then
-                break
-            end
-
-
-            -- =================================================
-            -- NUEVO:
-            -- Esperar 1.5 segundos antes de regresar
-            -- =================================================
-
-            task.wait(AFTER_PICKUP_WAIT)
-
-
-            if not HZ.Farm.Active then
-                break
-            end
-
-
-            -- Regresar
-            teleportTo(
-                RETURN_CFRAME
-            )
-
-
-            task.wait(RETURN_WAIT)
-
-        end
-
-
-        print("[HunterZ/Verity] Auto Farm detenido")
-
-    end)
+        end)
 
 end
 
 
--- ==================== STOP FARM ====================
+-- ============================================================
+--                       STOP FARM
+-- ============================================================
 
 local function stopFarmLoop()
 
@@ -435,32 +616,37 @@ local function stopFarmLoop()
 
     if HZ.Farm.Thread then
 
-        task.cancel(HZ.Farm.Thread)
+        task.cancel(
+            HZ.Farm.Thread
+        )
 
         HZ.Farm.Thread = nil
 
     end
 
 
-    print("[HunterZ/Verity] Auto Farm OFF")
+    print(
+        "[HunterZ/Verity] Auto Farm OFF"
+    )
 
 end
 
 
 -- ============================================================
---                         ESP
+--                         LIMPIAR ESP
 -- ============================================================
-
-
--- ==================== LIMPIAR ESP ====================
 
 local function clearESP()
 
-    for _, bucket in pairs(HZ.ESP.Drawings) do
+    for _, bucket in pairs(
+        HZ.ESP.Drawings
+    ) do
 
         if type(bucket) == "table" then
 
-            for _, drawing in ipairs(bucket) do
+            for _, drawing in ipairs(
+                bucket
+            ) do
 
                 pcall(function()
                     drawing:Remove()
@@ -478,87 +664,106 @@ local function clearESP()
 end
 
 
--- ==================== CREAR DRAWING ====================
+-- ============================================================
+--                    CREAR DRAWING TRACKED
+-- ============================================================
 
-local function trackedDrawing(class, bucket)
+local function trackedDrawing(
+    class,
+    bucket
+)
 
-    local d = Drawing.new(class)
+    local d =
+        Drawing.new(class)
+
 
     table.insert(
         bucket,
         d
     )
 
+
     return d
 
 end
 
 
--- ==================== CREAR BUCKET ====================
+-- ============================================================
+--                    CREAR ESP DE UNA CAJA
+-- ============================================================
 
 local function createESPBucket()
 
     local bucket = {}
 
 
-    -- 1 = outline
-    local outline = trackedDrawing(
-        "Square",
-        bucket
-    )
+    -- ========================================================
+    -- SOLO 5 DRAWINGS
+    --
+    -- 1 = Outline
+    -- 2 = Box
+    -- 3 = Name
+    -- 4 = Rarity
+    -- 5 = Weight
+    --
+    -- NO LINE / NO TRACER
+    -- ========================================================
 
 
-    -- 2 = box
-    local box = trackedDrawing(
-        "Square",
-        bucket
-    )
+    local outline =
+        trackedDrawing(
+            "Square",
+            bucket
+        )
 
 
-    -- 3 = line
-    local line = trackedDrawing(
-        "Line",
-        bucket
-    )
+    local box =
+        trackedDrawing(
+            "Square",
+            bucket
+        )
 
 
-    -- 4 = name
-    local lblName = trackedDrawing(
-        "Text",
-        bucket
-    )
+    local lblName =
+        trackedDrawing(
+            "Text",
+            bucket
+        )
 
 
-    -- 5 = rarity
-    local lblRarity = trackedDrawing(
-        "Text",
-        bucket
-    )
+    local lblRarity =
+        trackedDrawing(
+            "Text",
+            bucket
+        )
 
 
-    -- 6 = weight
-    local lblWeight = trackedDrawing(
-        "Text",
-        bucket
-    )
+    local lblWeight =
+        trackedDrawing(
+            "Text",
+            bucket
+        )
 
 
-    -- ==================== CONFIGURACIÓN ====================
-
-    -- Outline
+    -- ========================================================
+    -- OUTLINE
+    -- ========================================================
 
     outline.Visible = false
     outline.Filled = false
     outline.Thickness = 3
     outline.Transparency = 1
-    outline.Color = Color3.fromRGB(
-        0,
-        0,
-        0
-    )
+    outline.Color =
+        Color3.fromRGB(
+            0,
+            0,
+            0
+        )
 
 
-    -- Box
+    -- ========================================================
+    -- BOX
+    -- ========================================================
 
     box.Visible = false
     box.Filled = false
@@ -566,51 +771,53 @@ local function createESPBucket()
     box.Transparency = 1
 
 
-    -- Línea
-
-    line.Visible = false
-    line.Thickness = 1
-    line.Transparency = 0.5
-
-
-    -- Nombre
+    -- ========================================================
+    -- NOMBRE
+    -- ========================================================
 
     lblName.Visible = false
     lblName.Font = FONT_MAIN
     lblName.Outline = true
-    lblName.OutlineColor = Color3.fromRGB(
-        0,
-        0,
-        0
-    )
+    lblName.OutlineColor =
+        Color3.fromRGB(
+            0,
+            0,
+            0
+        )
     lblName.Transparency = 1
     lblName.Center = false
 
 
-    -- Rareza
+    -- ========================================================
+    -- RAREZA
+    -- ========================================================
 
     lblRarity.Visible = false
     lblRarity.Font = FONT_SUB
     lblRarity.Outline = true
-    lblRarity.OutlineColor = Color3.fromRGB(
-        0,
-        0,
-        0
-    )
+    lblRarity.OutlineColor =
+        Color3.fromRGB(
+            0,
+            0,
+            0
+        )
     lblRarity.Transparency = 1
     lblRarity.Center = false
 
 
-    -- Weight
+    -- ========================================================
+    -- WEIGHT
+    -- ========================================================
 
     lblWeight.Visible = false
     lblWeight.Font = FONT_SUB
     lblWeight.Outline = true
-    lblWeight.OutlineColor = Color3.fromRGB(
-        0,
-        0,
-        0
-    )
+    lblWeight.OutlineColor =
+        Color3.fromRGB(
+            0,
+            0,
+            0
+        )
     lblWeight.Transparency = 1
     lblWeight.Center = false
 
@@ -621,12 +828,21 @@ end
 
 
 -- ============================================================
---                      ESP LOOP
+--                         ESP LOOP
 -- ============================================================
 
 local function startESPLoop()
 
-    -- Evitar dos loops
+    -- ========================================================
+    -- IMPORTANTE:
+    -- Limpiar cualquier ESP anterior antes de arrancar.
+    -- ========================================================
+
+    clearESP()
+
+
+    -- Evitar dos loops simultáneos
+
     if HZ.ESP.Thread then
 
         task.cancel(
@@ -638,454 +854,494 @@ local function startESPLoop()
     end
 
 
-    HZ.ESP.Thread = task.spawn(function()
+    HZ.ESP.Thread =
+        task.spawn(function()
 
-        print(
-            "[HunterZ/Verity] ESP Boxes iniciado"
-        )
-
-
-        while HZ.ESP.Active do
-
-            -- Cámara actual
-            Camera = workspace.CurrentCamera
+            print(
+                "[HunterZ/Verity] ESP Boxes iniciado"
+            )
 
 
-            if not Camera then
+            while HZ.ESP.Active do
+
+
+                -- Cámara actual
+
+                Camera =
+                    workspace.CurrentCamera
+
+
+                if not Camera then
+
+                    task.wait(
+                        ESP_UPDATE_RATE
+                    )
+
+                    continue
+
+                end
+
+
+                -- Cajas actuales
+
+                local boxes =
+                    scanAllBoxes()
+
+
+                -- Personaje
+
+                local _, hrp =
+                    getCharacter()
+
+
+                -- Cajas actualmente existentes
+
+                local activeModels = {}
+
+
+                -- ====================================================
+                -- ACTUALIZAR CAJAS
+                -- ====================================================
+
+                for _, c in ipairs(boxes) do
+
+
+                    local model =
+                        c.model
+
+
+                    local info =
+                        c.info
+
+
+                    activeModels[model] =
+                        true
+
+
+                    pcall(function()
+
+
+                        if not model.Parent then
+                            return
+                        end
+
+
+                        -- Root
+
+                        local rootPart =
+                            getRoot(model)
+
+
+                        if not rootPart then
+                            return
+                        end
+
+
+                        -- =================================================
+                        -- Obtener/crear Drawing
+                        -- =================================================
+
+                        local bucket =
+                            HZ.ESP.Drawings[
+                                model
+                            ]
+
+
+                        -- Solo crear una vez
+
+                        if not bucket then
+
+                            bucket =
+                                createESPBucket()
+
+
+                            HZ.ESP.Drawings[
+                                model
+                            ] =
+                                bucket
+
+                        end
+
+
+                        -- =================================================
+                        -- Recuperar los 5 Drawing
+                        -- =================================================
+
+                        local outline =
+                            bucket[1]
+
+
+                        local box =
+                            bucket[2]
+
+
+                        local lblName =
+                            bucket[3]
+
+
+                        local lblRarity =
+                            bucket[4]
+
+
+                        local lblWeight =
+                            bucket[5]
+
+
+                        -- =================================================
+                        -- Ocultar antes de actualizar
+                        -- =================================================
+
+                        outline.Visible = false
+                        box.Visible = false
+                        lblName.Visible = false
+                        lblRarity.Visible = false
+                        lblWeight.Visible = false
+
+
+                        -- =================================================
+                        -- DISTANCIA
+                        -- =================================================
+
+                        if hrp then
+
+                            local dist =
+                                (
+                                    rootPart.Position
+                                    - hrp.Position
+                                ).Magnitude
+
+
+                            if dist >
+                                ESP_MAX_DIST then
+
+                                return
+
+                            end
+
+                        end
+
+
+                        -- =================================================
+                        -- WORLD TO SCREEN
+                        -- =================================================
+
+                        local screenVector,
+                              onScreen =
+                            Camera:WorldToViewportPoint(
+                                rootPart.Position
+                            )
+
+
+                        local screenPos =
+                            Vector2.new(
+                                screenVector.X,
+                                screenVector.Y
+                            )
+
+
+                        local depth =
+                            screenVector.Z
+
+
+                        if not onScreen
+                            or depth <= 1 then
+
+                            return
+
+                        end
+
+
+                        -- =================================================
+                        -- DATOS
+                        -- =================================================
+
+                        local rarity =
+                            info.rarityType
+
+
+                        local weight =
+                            info.weight
+
+
+                        local boxColor =
+                            RARITY_COLOR[
+                                rarity
+                            ]
+                            or Color3.fromRGB(
+                                0,
+                                255,
+                                128
+                            )
+
+
+                        -- =================================================
+                        -- TAMAÑO
+                        -- =================================================
+
+                        local boxH =
+                            math.clamp(
+                                1600 / depth,
+                                18,
+                                100
+                            )
+
+
+                        local boxW =
+                            boxH * 0.8
+
+
+                        local halfW =
+                            boxW * 0.5
+
+
+                        local halfH =
+                            boxH * 0.5
+
+
+                        local topY =
+                            screenPos.Y
+                            - halfH
+
+
+                        local leftX =
+                            screenPos.X
+                            - halfW
+
+
+                        -- =================================================
+                        -- OUTLINE
+                        -- =================================================
+
+                        outline.Visible = true
+
+                        outline.Size =
+                            Vector2.new(
+                                boxW + 4,
+                                boxH + 4
+                            )
+
+
+                        outline.Position =
+                            Vector2.new(
+                                leftX - 2,
+                                topY - 2
+                            )
+
+
+                        -- =================================================
+                        -- BOX
+                        -- =================================================
+
+                        box.Visible = true
+
+                        box.Color =
+                            boxColor
+
+
+                        box.Size =
+                            Vector2.new(
+                                boxW,
+                                boxH
+                            )
+
+
+                        box.Position =
+                            Vector2.new(
+                                leftX,
+                                topY
+                            )
+
+
+                        -- =================================================
+                        -- TEXTO
+                        -- =================================================
+
+                        local labelSize =
+                            math.clamp(
+                                math.floor(
+                                    1200 / depth
+                                ),
+                                9,
+                                15
+                            )
+
+
+                        local lineH =
+                            labelSize + 3
+
+
+                        local labelX =
+                            leftX
+
+
+                        local labelY =
+                            topY
+                            + boxH
+                            + 4
+
+
+                        -- =================================================
+                        -- NOMBRE
+                        -- =================================================
+
+                        lblName.Visible = true
+
+                        lblName.Text =
+                            "[" ..
+                            model.Name ..
+                            "]"
+
+
+                        lblName.Size =
+                            labelSize
+
+
+                        lblName.Color =
+                            boxColor
+
+
+                        lblName.Position =
+                            Vector2.new(
+                                labelX,
+                                labelY
+                            )
+
+
+                        -- =================================================
+                        -- RAREZA
+                        -- =================================================
+
+                        lblRarity.Visible = true
+
+                        lblRarity.Text =
+                            "[" ..
+                            rarity ..
+                            "]"
+
+
+                        lblRarity.Size =
+                            labelSize - 1
+
+
+                        lblRarity.Color =
+                            Color3.fromRGB(
+                                210,
+                                210,
+                                210
+                            )
+
+
+                        lblRarity.Position =
+                            Vector2.new(
+                                labelX,
+                                labelY + lineH
+                            )
+
+
+                        -- =================================================
+                        -- WEIGHT
+                        -- =================================================
+
+                        lblWeight.Visible = true
+
+                        lblWeight.Text =
+                            "[Weight: "
+                            .. formatWeight(
+                                weight
+                            )
+                            .. "]"
+
+
+                        lblWeight.Size =
+                            labelSize - 1
+
+
+                        lblWeight.Color =
+                            Color3.fromRGB(
+                                255,
+                                210,
+                                60
+                            )
+
+
+                        lblWeight.Position =
+                            Vector2.new(
+                                labelX,
+                                labelY
+                                + lineH * 2
+                            )
+
+
+                    end)
+
+                end
+
+
+                -- ====================================================
+                -- ELIMINAR SOLO CAJAS QUE YA NO EXISTAN
+                -- ====================================================
+
+                for model, bucket in pairs(
+                    HZ.ESP.Drawings
+                ) do
+
+
+                    if not activeModels[model]
+                        or not model.Parent then
+
+
+                        for _, drawing in ipairs(
+                            bucket
+                        ) do
+
+                            pcall(function()
+                                drawing:Remove()
+                            end)
+
+                        end
+
+
+                        HZ.ESP.Drawings[
+                            model
+                        ] = nil
+
+
+                    end
+
+                end
+
+
+                -- ====================================================
+                -- ACTUALIZACIÓN
+                -- ====================================================
 
                 task.wait(
                     ESP_UPDATE_RATE
                 )
 
-                continue
 
             end
 
 
-            -- Obtener cajas actuales
-            local boxes = scanAllBoxes()
+            -- ========================================================
+            -- AL APAGAR
+            -- ========================================================
 
+            clearESP()
 
-            -- Jugador
-            local _, hrp = getCharacter()
 
-
-            -- Pantalla
-            local vpSize =
-                Camera.ViewportSize
-
-
-            local screenCenter =
-                Vector2.new(
-                    vpSize.X * 0.5,
-                    vpSize.Y
-                )
-
-
-            -- Lista para saber cuáles siguen existiendo
-            local activeModels = {}
-
-
-            -- =================================================
-            -- ACTUALIZAR CAJAS
-            -- =================================================
-
-            for _, c in ipairs(boxes) do
-
-                local model = c.model
-                local info = c.info
-
-
-                activeModels[model] = true
-
-
-                pcall(function()
-
-                    if not model.Parent then
-                        return
-                    end
-
-
-                    -- Root
-                    local rootPart =
-                        getRoot(model)
-
-
-                    if not rootPart then
-                        return
-                    end
-
-
-                    -- =================================================
-                    -- Crear Drawing SOLO si todavía no existe
-                    -- =================================================
-
-                    local bucket =
-                        HZ.ESP.Drawings[model]
-
-
-                    if not bucket then
-
-                        bucket =
-                            createESPBucket()
-
-
-                        HZ.ESP.Drawings[model] =
-                            bucket
-
-                    end
-
-
-                    -- Obtener dibujos
-
-                    local outline =
-                        bucket[1]
-
-                    local box =
-                        bucket[2]
-
-                    local line =
-                        bucket[3]
-
-                    local lblName =
-                        bucket[4]
-
-                    local lblRarity =
-                        bucket[5]
-
-                    local lblWeight =
-                        bucket[6]
-
-
-                    -- Ocultar antes de comprobar
-                    outline.Visible = false
-                    box.Visible = false
-                    line.Visible = false
-                    lblName.Visible = false
-                    lblRarity.Visible = false
-                    lblWeight.Visible = false
-
-
-                    -- =================================================
-                    -- DISTANCIA
-                    -- =================================================
-
-                    if hrp then
-
-                        local dist =
-                            (
-                                rootPart.Position
-                                - hrp.Position
-                            ).Magnitude
-
-
-                        if dist > ESP_MAX_DIST then
-                            return
-                        end
-
-                    end
-
-
-                    -- =================================================
-                    -- WORLD TO SCREEN
-                    -- =================================================
-
-                    local worldPos =
-                        rootPart.Position
-
-
-                    local screenVector,
-                          onScreen =
-                        Camera:WorldToViewportPoint(
-                            worldPos
-                        )
-
-
-                    local screenPos =
-                        Vector2.new(
-                            screenVector.X,
-                            screenVector.Y
-                        )
-
-
-                    local depth =
-                        screenVector.Z
-
-
-                    if not onScreen
-                        or depth <= 1 then
-
-                        return
-
-                    end
-
-
-                    -- =================================================
-                    -- DATOS
-                    -- =================================================
-
-                    local rarity =
-                        info.rarityType
-
-
-                    local weight =
-                        info.weight
-
-
-                    local boxColor =
-                        RARITY_COLOR[rarity]
-                        or Color3.fromRGB(
-                            0,
-                            255,
-                            128
-                        )
-
-
-                    -- =================================================
-                    -- TAMAÑO DEL BOX
-                    -- =================================================
-
-                    local boxH =
-                        math.clamp(
-                            1600 / depth,
-                            18,
-                            100
-                        )
-
-
-                    local boxW =
-                        boxH * 0.8
-
-
-                    local halfW =
-                        boxW * 0.5
-
-
-                    local halfH =
-                        boxH * 0.5
-
-
-                    local topY =
-                        screenPos.Y - halfH
-
-
-                    local leftX =
-                        screenPos.X - halfW
-
-
-                    -- =================================================
-                    -- OUTLINE
-                    -- =================================================
-
-                    outline.Visible = true
-
-                    outline.Size =
-                        Vector2.new(
-                            boxW + 4,
-                            boxH + 4
-                        )
-
-                    outline.Position =
-                        Vector2.new(
-                            leftX - 2,
-                            topY - 2
-                        )
-
-
-                    -- =================================================
-                    -- BOX
-                    -- =================================================
-
-                    box.Visible = true
-
-                    box.Color =
-                        boxColor
-
-                    box.Size =
-                        Vector2.new(
-                            boxW,
-                            boxH
-                        )
-
-                    box.Position =
-                        Vector2.new(
-                            leftX,
-                            topY
-                        )
-
-
-                    -- =================================================
-                    -- LÍNEA
-                    -- =================================================
-
-                    line.Visible = true
-
-                    line.Color =
-                        boxColor
-
-                    line.From =
-                        screenCenter
-
-                    line.To =
-                        screenPos
-
-
-                    -- =================================================
-                    -- TEXTO
-                    -- =================================================
-
-                    local labelSize =
-                        math.clamp(
-                            math.floor(
-                                1200 / depth
-                            ),
-                            9,
-                            15
-                        )
-
-
-                    local lineH =
-                        labelSize + 3
-
-
-                    local labelX =
-                        leftX
-
-
-                    local labelY =
-                        topY + boxH + 4
-
-
-                    -- Nombre
-
-                    lblName.Visible = true
-
-                    lblName.Text =
-                        "[" .. model.Name .. "]"
-
-                    lblName.Size =
-                        labelSize
-
-                    lblName.Color =
-                        boxColor
-
-                    lblName.Position =
-                        Vector2.new(
-                            labelX,
-                            labelY
-                        )
-
-
-                    -- Rareza
-
-                    lblRarity.Visible = true
-
-                    lblRarity.Text =
-                        "[" .. rarity .. "]"
-
-                    lblRarity.Size =
-                        labelSize - 1
-
-                    lblRarity.Color =
-                        Color3.fromRGB(
-                            210,
-                            210,
-                            210
-                        )
-
-                    lblRarity.Position =
-                        Vector2.new(
-                            labelX,
-                            labelY + lineH
-                        )
-
-
-                    -- Weight
-
-                    lblWeight.Visible = true
-
-                    lblWeight.Text =
-                        "[Weight: "
-                        .. formatWeight(weight)
-                        .. "]"
-
-                    lblWeight.Size =
-                        labelSize - 1
-
-                    lblWeight.Color =
-                        Color3.fromRGB(
-                            255,
-                            210,
-                            60
-                        )
-
-                    lblWeight.Position =
-                        Vector2.new(
-                            labelX,
-                            labelY + lineH * 2
-                        )
-
-                end)
-
-            end
-
-
-            -- =================================================
-            -- ELIMINAR SOLO CAJAS QUE YA NO EXISTEN
-            -- =================================================
-
-            for model, bucket in pairs(
-                HZ.ESP.Drawings
-            ) do
-
-                if not activeModels[model]
-                    or not model.Parent then
-
-
-                    for _, drawing in ipairs(
-                        bucket
-                    ) do
-
-                        pcall(function()
-                            drawing:Remove()
-                        end)
-
-                    end
-
-
-                    HZ.ESP.Drawings[model] =
-                        nil
-
-                end
-
-            end
-
-
-            -- =================================================
-            -- ESP UPDATE
-            -- =================================================
-
-            task.wait(
-                ESP_UPDATE_RATE
+            print(
+                "[HunterZ/Verity] ESP Boxes detenido"
             )
 
-        end
-
-
-        -- Al apagar el ESP
-        clearESP()
-
-
-        print(
-            "[HunterZ/Verity] ESP Boxes detenido"
-        )
-
-    end)
+        end)
 
 end
 
 
--- ==================== STOP ESP ====================
+-- ============================================================
+--                         STOP ESP
+-- ============================================================
 
 local function stopESPLoop()
 
@@ -1114,22 +1370,25 @@ end
 
 
 -- ============================================================
---                         MÓDULO
+--                          MÓDULO
 -- ============================================================
 
 return {
 
     actions = {
 
-        -- =====================================================
+
+        -- ======================================================
         -- AUTO FARM
-        -- =====================================================
+        -- ======================================================
 
         ["[Farm] Auto Farm Boxes"] = {
 
             toggle = true,
 
+
             fn = function(state)
+
 
                 HZ.Farm.Active =
                     (state == nil)
@@ -1147,20 +1406,23 @@ return {
 
                 end
 
+
             end
 
         },
 
 
-        -- =====================================================
+        -- ======================================================
         -- ESP
-        -- =====================================================
+        -- ======================================================
 
         ["[Visual] ESP Boxes"] = {
 
             toggle = true,
 
+
             fn = function(state)
+
 
                 HZ.ESP.Active =
                     (state == nil)
@@ -1177,6 +1439,7 @@ return {
                     stopESPLoop()
 
                 end
+
 
             end
 
