@@ -78,7 +78,7 @@ local RETURN_CFRAME = CFrame.new(
 -- Tiempos (valores que funcionaron)
 local RETRY_WAIT  = 2
 local INSIDE_WAIT = 5
-local RETURN_WAIT = 4
+local RETURN_WAIT = 3.5
 local PICKUP_HOLD = 1
 
 -- Distancia máxima para mostrar en ESP (studs). Evita ruido visual de cajas lejanas.
